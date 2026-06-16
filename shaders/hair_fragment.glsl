@@ -12,6 +12,7 @@ uniform vec3 uAmbientColor;
 uniform float uSpecularStrength;
 uniform float uShininess;
 uniform vec3 uCameraPos;
+uniform float uWetness;
 
 out vec4 fragColor;
 
@@ -32,12 +33,19 @@ void main() {
     vec3 tipColor = baseColor * 1.3;
     vec3 finalColor = mix(baseColor, tipColor, tipFactor * 0.3);
 
+    float wet = clamp(uWetness, 0.0, 1.0);
+    finalColor *= 1.0 - wet * 0.55;
+
+    float wetSpecBoost = 1.0 + wet * 3.0;
+    specular *= wetSpecBoost;
+
     vec3 ambient = uAmbientColor * finalColor;
     vec3 diffuseColor = diffuse * finalColor * uLightColor;
 
     vec3 result = ambient + diffuseColor + specular;
 
     float alpha = 1.0 - gSegmentT * 0.3;
+    alpha = mix(alpha, 0.95, wet * 0.8);
 
     fragColor = vec4(result, alpha);
 }

@@ -139,6 +139,31 @@ void UISystem::renderParameterPanel() {
         ImGui::PopItemWidth();
     }
 
+    if (ImGui::CollapsingHeader("Wet Effect", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushItemWidth(-1);
+
+        int wetnessPercent = (int)(params.wetness * 100.0f);
+        if (ImGui::SliderInt("Wetness", &wetnessPercent, 0, 100, "%d %%")) {
+            params.wetness = (float)wetnessPercent / 100.0f;
+        }
+
+        if (params.wetness > 0.001f) {
+            ImGui::Indent();
+            ImGui::SliderFloat("Clumping Strength", &params.wetClumpingStrength, 0.0f, 2.0f, "%.3f");
+            ImGui::SliderFloat("Damping Boost", &params.wetDampingBoost, 0.0f, 5.0f, "%.2f");
+            ImGui::SliderFloat("Stiffness Boost", &params.wetStiffnessBoost, 0.0f, 3.0f, "%.2f");
+            ImGui::Unindent();
+
+            ImGui::Spacing();
+            float effectLevel = params.wetness;
+            ImGui::ProgressBar(effectLevel, ImVec2(-1, 0), "Effect Intensity");
+            ImGui::SameLine();
+            ImGui::Text("%d%%", (int)(effectLevel * 100));
+        }
+
+        ImGui::PopItemWidth();
+    }
+
     if (ImGui::CollapsingHeader("Wind", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushItemWidth(-1);
         ImGui::SliderFloat("Wind Strength", &params.windStrength, 0.0f, 20.0f, "%.1f");
@@ -194,6 +219,7 @@ void UISystem::renderParameterPanel() {
         ImGui::Checkbox("Wireframe", &m_showWireframe);
         if (m_renderer) {
             m_renderer->setWireframe(m_showWireframe);
+            m_renderer->setWetness(params.wetness);
         }
         ImGui::PopItemWidth();
     }

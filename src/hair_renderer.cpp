@@ -25,6 +25,7 @@ HairRenderer::HairRenderer()
     , m_tipScale(0.3f)
     , m_wireframe(false)
     , m_showGuideCurves(false)
+    , m_wetness(0.0f)
     , m_activeStrands(0)
     , m_initialized(false)
     , m_lastRenderTimeMs(0.0f)
@@ -513,6 +514,8 @@ void HairRenderer::render(const glm::mat4& viewMatrix,
                 0.3f);
     glUniform1f(glGetUniformLocation(m_shaderProgram, "uShininess"),
                 32.0f);
+    glUniform1f(glGetUniformLocation(m_shaderProgram, "uWetness"),
+                m_wetness);
 
     glBindVertexArray(m_vao);
 

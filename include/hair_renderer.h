@@ -25,6 +25,7 @@ public:
     void setTipScale(float scale) { m_tipScale = scale; }
     void setWireframe(bool enabled) { m_wireframe = enabled; }
     void setShowGuideCurves(bool show) { m_showGuideCurves = show; }
+    void setWetness(float wetness) { m_wetness = wetness; }
 
     uint32_t getMaxStrands() const { return m_maxStrands; }
     uint32_t getSegmentsPerStrand() const { return m_segmentsPerStrand; }
@@ -61,6 +62,7 @@ private:
     float m_tipScale;
     bool m_wireframe;
     bool m_showGuideCurves;
+    float m_wetness;
 
     std::vector<int32_t> m_multiDrawFirsts;
     std::vector<int32_t> m_multiDrawCounts;

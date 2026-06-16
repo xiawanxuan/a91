@@ -512,6 +512,105 @@ __global__ void selfCollisionKernel(
     }
 }
 
+__global__ void wetClumpingKernel(
+    StrandParticle* particles,
+    const uint32_t* sortedIndices,
+    const uint32_t* bucketStart,
+    const uint32_t* bucketCounts,
+    const uint32_t* particleStrandIds,
+    uint32_t totalParticles,
+    float hairRadius,
+    float wetness,
+    float clumpingStrength,
+    uint32_t segmentsPerStrand)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalParticles) return;
+
+    uint32_t seg0 = idx % segmentsPerStrand;
+    if (seg0 == 0) return;
+
+    uint32_t strand0 = particleStrandIds[idx];
+    StrandParticle& p0 = particles[idx];
+    Vec3 pos0 = p0.position;
+
+    float cellSize = hairRadius * 3.0f;
+    int32_t cx = (int32_t)floorf(pos0.x / cellSize);
+    int32_t cy = (int32_t)floorf(pos0.y / cellSize);
+    int32_t cz = (int32_t)floorf(pos0.z / cellSize);
+
+    uint32_t neighborCells[27];
+    #pragma unroll
+    for (int i = 0; i < 27; i++) {
+        int32_t dz = (i / 9) - 1;
+        int32_t dy = ((i % 9) / 3) - 1;
+        int32_t dx = (i % 3) - 1;
+        neighborCells[i] = computeCellHash(
+            cx + dx, cy + dy, cz + dz,
+            SPATIAL_HASH_GRID_SIZE,
+            SPATIAL_HASH_NUM_BUCKETS);
+    }
+
+    float clumpRadius = hairRadius * 4.0f;
+    float clumpRadiusSq = clumpRadius * clumpRadius;
+    float attractionStrength = wetness * clumpingStrength;
+
+    if (attractionStrength < 1e-5f) return;
+
+    Vec3 centerOfMass(0, 0, 0);
+    uint32_t neighborCount = 0;
+    const uint32_t bucketCap = SPATIAL_HASH_BUCKET_SIZE;
+
+    #pragma unroll
+    for (int nc = 0; nc < 27; nc++) {
+        uint32_t hashVal = neighborCells[nc];
+        uint32_t start = bucketStart[hashVal];
+        uint32_t count = bucketCounts[hashVal];
+
+        if (count > bucketCap) count = bucketCap;
+
+        for (uint32_t j = 0; j < count; j++) {
+            uint32_t otherIdx = sortedIndices[start + j];
+
+            if (otherIdx >= totalParticles || otherIdx == idx) continue;
+
+            uint32_t strand1 = particleStrandIds[otherIdx];
+            if (strand0 == strand1) continue;
+
+            Vec3 p1pos = particles[otherIdx].position;
+            Vec3 diff = pos0 - p1pos;
+            float distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
+
+            if (distSq < clumpRadiusSq && distSq > 1e-10f) {
+                centerOfMass.x += p1pos.x;
+                centerOfMass.y += p1pos.y;
+                centerOfMass.z += p1pos.z;
+                neighborCount++;
+            }
+        }
+    }
+
+    if (neighborCount > 0) {
+        float invCount = 1.0f / (float)neighborCount;
+        centerOfMass.x *= invCount;
+        centerOfMass.y *= invCount;
+        centerOfMass.z *= invCount;
+
+        Vec3 toCenter(
+            centerOfMass.x - pos0.x,
+            centerOfMass.y - pos0.y,
+            centerOfMass.z - pos0.z
+        );
+
+        float segT = (float)seg0 / (float)segmentsPerStrand;
+        float tipBias = 0.4f + 0.6f * segT;
+
+        p0.position.x += toCenter.x * attractionStrength * tipBias;
+        p0.position.y += toCenter.y * attractionStrength * tipBias;
+        p0.position.z += toCenter.z * attractionStrength * tipBias;
+    }
+}
+
 __global__ void computeRestLengthsKernel(
     StrandParticle* particles,
     float* restLengths,
@@ -921,6 +1020,11 @@ void HairSimulationGPU::computePhysics(float dt) {
     uint32_t gridSize = (m_numParticles + blockSize - 1) / blockSize;
     uint32_t strandGridSize = (m_params.numHairStrands + blockSize - 1) / blockSize;
 
+    float wetness = fminf(1.0f, fmaxf(0.0f, m_params.wetness));
+    float effectiveDamping = m_params.damping * (1.0f + wetness * m_params.wetDampingBoost);
+    float effectiveBendStiffness = m_params.bendStiffness * (1.0f + wetness * m_params.wetStiffnessBoost);
+    float effectiveWindScale = 1.0f - wetness * 0.7f;
+
     applyGravityKernel<<<gridSize, blockSize>>>(
         m_d_particles,
         m_numParticles,
@@ -932,7 +1036,7 @@ void HairSimulationGPU::computePhysics(float dt) {
         m_d_particles,
         m_numParticles,
         m_params.globalWind,
-        m_params.windStrength,
+        m_params.windStrength * effectiveWindScale,
         dt,
         m_params.hairRadius
     );
@@ -949,7 +1053,7 @@ void HairSimulationGPU::computePhysics(float dt) {
     applyDampingKernel<<<gridSize, blockSize>>>(
         m_d_particles,
         m_numParticles,
-        m_params.damping,
+        effectiveDamping,
         dt
     );
 
@@ -980,7 +1084,7 @@ void HairSimulationGPU::computePhysics(float dt) {
             m_params.numHairStrands,
             m_params.segmentsPerStrand,
             m_d_restTangents,
-            m_params.bendStiffness
+            effectiveBendStiffness
         );
 
         if (m_params.twistStiffness > 0.001f) {
@@ -1002,20 +1106,37 @@ void HairSimulationGPU::computePhysics(float dt) {
         m_params.friction
     );
 
-    if (m_params.enableSelfCollision) {
+    if (m_params.enableSelfCollision || wetness > 0.001f) {
         buildSpatialHash();
 
-        selfCollisionKernel<<<gridSize, blockSize>>>(
-            m_d_particles,
-            m_d_spatialHashSorted,
-            m_d_spatialHashBuckets,
-            m_d_spatialHashCounts,
-            m_d_particleStrandIds,
-            m_numParticles,
-            m_params.selfCollisionRadius,
-            0.8f,
-            m_params.segmentsPerStrand
-        );
+        if (m_params.enableSelfCollision) {
+            selfCollisionKernel<<<gridSize, blockSize>>>(
+                m_d_particles,
+                m_d_spatialHashSorted,
+                m_d_spatialHashBuckets,
+                m_d_spatialHashCounts,
+                m_d_particleStrandIds,
+                m_numParticles,
+                m_params.selfCollisionRadius,
+                0.8f,
+                m_params.segmentsPerStrand
+            );
+        }
+
+        if (wetness > 0.001f) {
+            wetClumpingKernel<<<gridSize, blockSize>>>(
+                m_d_particles,
+                m_d_spatialHashSorted,
+                m_d_spatialHashBuckets,
+                m_d_spatialHashCounts,
+                m_d_particleStrandIds,
+                m_numParticles,
+                m_params.hairRadius,
+                wetness,
+                m_params.wetClumpingStrength,
+                m_params.segmentsPerStrand
+            );
+        }
     }
 
     cudaDeviceSynchronize();

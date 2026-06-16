@@ -124,6 +124,10 @@ struct SimulationParams {
     bool enableSelfCollision;
     float selfCollisionRadius;
     float friction;
+    float wetness;
+    float wetClumpingStrength;
+    float wetDampingBoost;
+    float wetStiffnessBoost;
 };
 
 struct GPUInterpolationData {

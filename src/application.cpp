@@ -133,6 +133,10 @@ bool Application::initSystems() {
     m_initialParams.enableSelfCollision = false;
     m_initialParams.selfCollisionRadius = 0.01f;
     m_initialParams.friction = 0.3f;
+    m_initialParams.wetness = 0.0f;
+    m_initialParams.wetClumpingStrength = 0.8f;
+    m_initialParams.wetDampingBoost = 2.0f;
+    m_initialParams.wetStiffnessBoost = 1.5f;
 
     m_simulation = std::make_unique<HairSimulationGPU>();
     if (!m_simulation->initialize(m_initialParams)) {
