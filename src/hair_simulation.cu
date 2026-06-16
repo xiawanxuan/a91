@@ -1,8 +1,10 @@
 #include "hair_simulation.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <thrust/device_ptr.h>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
+#include <thrust/sequence.h>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -420,42 +422,18 @@ __global__ void capsuleCollisionKernel(
     }
 }
 
-__global__ void spatialHashBuildKernel(
-    const StrandParticle* particles,
-    uint32_t totalParticles,
-    float cellSize,
+__device__ __forceinline__ uint32_t computeCellHash(
+    int32_t cx, int32_t cy, int32_t cz,
     uint32_t gridSize,
-    uint32_t* particleCells,
-    uint32_t* bucketCounts,
-    uint32_t numBuckets)
-{
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= totalParticles) return;
-
-    Vec3 pos = particles[idx].position;
-
-    int32_t cx = (int32_t)floorf(pos.x / cellSize);
-    int32_t cy = (int32_t)floorf(pos.y / cellSize);
-    int32_t cz = (int32_t)floorf(pos.z / cellSize);
-
-    cx = (cx % gridSize + gridSize) % gridSize;
-    cy = (cy % gridSize + gridSize) % gridSize;
-    cz = (cz % gridSize + gridSize) % gridSize;
-
-    uint32_t hashVal = (cx * 73856093u) ^ (cy * 19349663u) ^ (cz * 83492791u);
-    hashVal = hashVal % numBuckets;
-
-    particleCells[idx] = hashVal;
-    atomicAdd(&bucketCounts[hashVal], 1);
-}
+    uint32_t numBuckets);
 
 __global__ void selfCollisionKernel(
     StrandParticle* particles,
     const uint32_t* sortedIndices,
     const uint32_t* bucketStart,
     const uint32_t* bucketCounts,
+    const uint32_t* particleStrandIds,
     uint32_t totalParticles,
-    uint32_t numBuckets,
     float collisionRadius,
     float stiffness,
     uint32_t segmentsPerStrand)
@@ -463,62 +441,74 @@ __global__ void selfCollisionKernel(
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= totalParticles) return;
 
-    StrandParticle& p0 = particles[idx];
-
-    uint32_t strand0 = idx / segmentsPerStrand;
     uint32_t seg0 = idx % segmentsPerStrand;
-
     if (seg0 == 0) return;
 
+    uint32_t strand0 = particleStrandIds[idx];
+    StrandParticle& p0 = particles[idx];
     Vec3 pos0 = p0.position;
 
-    float cellSize = collisionRadius * 4.0f;
-
+    float cellSize = collisionRadius * 3.0f;
     int32_t cx = (int32_t)floorf(pos0.x / cellSize);
     int32_t cy = (int32_t)floorf(pos0.y / cellSize);
     int32_t cz = (int32_t)floorf(pos0.z / cellSize);
 
+    uint32_t neighborCells[27];
+    #pragma unroll
+    for (int i = 0; i < 27; i++) {
+        int32_t dz = (i / 9) - 1;
+        int32_t dy = ((i % 9) / 3) - 1;
+        int32_t dx = (i % 3) - 1;
+        neighborCells[i] = computeCellHash(
+            cx + dx, cy + dy, cz + dz,
+            SPATIAL_HASH_GRID_SIZE,
+            SPATIAL_HASH_NUM_BUCKETS);
+    }
+
+    float minDist = collisionRadius * 2.0f;
+    float minDistSq = minDist * minDist;
+
     Vec3 totalCorrection(0, 0, 0);
     uint32_t collisionCount = 0;
+    const uint32_t bucketCap = SPATIAL_HASH_BUCKET_SIZE;
 
-    for (int32_t dz = -1; dz <= 1; dz++) {
-        for (int32_t dy = -1; dy <= 1; dy++) {
-            for (int32_t dx = -1; dx <= 1; dx++) {
-                int32_t ncx = ((cx + dx) % (int32_t)SPATIAL_HASH_GRID_SIZE + (int32_t)SPATIAL_HASH_GRID_SIZE) % (int32_t)SPATIAL_HASH_GRID_SIZE;
-                int32_t ncy = ((cy + dy) % (int32_t)SPATIAL_HASH_GRID_SIZE + (int32_t)SPATIAL_HASH_GRID_SIZE) % (int32_t)SPATIAL_HASH_GRID_SIZE;
-                int32_t ncz = ((cz + dz) % (int32_t)SPATIAL_HASH_GRID_SIZE + (int32_t)SPATIAL_HASH_GRID_SIZE) % (int32_t)SPATIAL_HASH_GRID_SIZE;
+    #pragma unroll
+    for (int nc = 0; nc < 27; nc++) {
+        uint32_t hashVal = neighborCells[nc];
+        uint32_t start = bucketStart[hashVal];
+        uint32_t count = bucketCounts[hashVal];
 
-                uint32_t hashVal = (ncx * 73856093u) ^ (ncy * 19349663u) ^ (ncz * 83492791u);
-                hashVal = hashVal % numBuckets;
+        if (count > bucketCap) count = bucketCap;
 
-                uint32_t start = bucketStart[hashVal];
-                uint32_t count = bucketCounts[hashVal];
+        for (uint32_t j = 0; j < count; j++) {
+            uint32_t otherIdx = sortedIndices[start + j];
 
-                for (uint32_t j = 0; j < count && j < SPATIAL_HASH_BUCKET_SIZE; j++) {
-                    uint32_t otherIdx = sortedIndices[start + j];
-                    if (otherIdx >= totalParticles || otherIdx == idx) continue;
+            if (otherIdx >= totalParticles || otherIdx == idx) continue;
 
-                    uint32_t strand1 = otherIdx / segmentsPerStrand;
-                    if (strand0 == strand1) continue;
+            uint32_t strand1 = particleStrandIds[otherIdx];
+            if (strand0 == strand1) continue;
 
-                    Vec3 diff = pos0 - particles[otherIdx].position;
-                    float distSq = lengthSq(diff);
-                    float minDist = collisionRadius * 2.0f;
+            Vec3 p1pos = particles[otherIdx].position;
+            Vec3 diff = pos0 - p1pos;
+            float distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
 
-                    if (distSq < minDist * minDist && distSq > 1e-10f) {
-                        float dist = sqrtf(distSq);
-                        Vec3 normal = diff / dist;
-                        float penetration = (minDist - dist) * 0.5f * stiffness;
-                        totalCorrection = totalCorrection + normal * penetration;
-                        collisionCount++;
-                    }
-                }
+            if (distSq < minDistSq && distSq > 1e-10f) {
+                float dist = sqrtf(distSq);
+                float invDist = 1.0f / dist;
+                float penetration = (minDist - dist) * 0.5f * stiffness;
+                totalCorrection.x += diff.x * invDist * penetration;
+                totalCorrection.y += diff.y * invDist * penetration;
+                totalCorrection.z += diff.z * invDist * penetration;
+                collisionCount++;
             }
         }
     }
 
     if (collisionCount > 0) {
-        p0.position = p0.position + totalCorrection / (float)collisionCount;
+        float invCount = 1.0f / (float)collisionCount;
+        p0.position.x += totalCorrection.x * invCount;
+        p0.position.y += totalCorrection.y * invCount;
+        p0.position.z += totalCorrection.z * invCount;
     }
 }
 
@@ -623,6 +613,111 @@ __global__ void gpuInterpolationKernel(
     }
 }
 
+__global__ void initStrandIdsKernel(
+    uint32_t* strandIds,
+    uint32_t numStrands,
+    uint32_t segmentsPerStrand)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t totalParticles = numStrands * segmentsPerStrand;
+    if (idx >= totalParticles) return;
+    strandIds[idx] = idx / segmentsPerStrand;
+}
+
+__device__ __forceinline__ uint32_t computeCellHash(
+    int32_t cx, int32_t cy, int32_t cz,
+    uint32_t gridSize,
+    uint32_t numBuckets)
+{
+    cx = (cx % (int32_t)gridSize + (int32_t)gridSize) % (int32_t)gridSize;
+    cy = (cy % (int32_t)gridSize + (int32_t)gridSize) % (int32_t)gridSize;
+    cz = (cz % (int32_t)gridSize + (int32_t)gridSize) % (int32_t)gridSize;
+
+    uint32_t hx = (uint32_t)cx * 73856093u;
+    uint32_t hy = (uint32_t)cy * 19349663u;
+    uint32_t hz = (uint32_t)cz * 83492791u;
+    return (hx ^ hy ^ hz) % numBuckets;
+}
+
+__global__ void spatialHashAssignKernel(
+    const StrandParticle* particles,
+    uint32_t totalParticles,
+    float cellSize,
+    uint32_t gridSize,
+    uint32_t numBuckets,
+    uint32_t* particleCells)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalParticles) return;
+
+    Vec3 pos = particles[idx].position;
+    int32_t cx = (int32_t)floorf(pos.x / cellSize);
+    int32_t cy = (int32_t)floorf(pos.y / cellSize);
+    int32_t cz = (int32_t)floorf(pos.z / cellSize);
+
+    uint32_t hashVal = computeCellHash(cx, cy, cz, gridSize, numBuckets);
+    particleCells[idx] = hashVal;
+}
+
+__global__ void bucketBoundaryMarkersKernel(
+    const uint32_t* sortedCells,
+    uint32_t totalParticles,
+    uint32_t numBuckets,
+    uint32_t* bucketStart,
+    uint32_t* bucketCounts)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t totalWork = totalParticles + 1;
+    if (idx >= totalWork) return;
+
+    if (idx == 0) {
+        if (totalParticles > 0) {
+            uint32_t firstCell = sortedCells[0];
+            if (firstCell < numBuckets) {
+                bucketStart[firstCell] = 0;
+            }
+        }
+        return;
+    }
+
+    if (idx >= totalParticles) return;
+
+    uint32_t curCell = sortedCells[idx];
+    uint32_t prevCell = sortedCells[idx - 1];
+
+    if (curCell != prevCell) {
+        if (curCell < numBuckets) {
+            bucketStart[curCell] = idx;
+        }
+    }
+}
+
+__global__ void countBucketSizesKernel(
+    const uint32_t* sortedCells,
+    uint32_t totalParticles,
+    uint32_t numBuckets,
+    const uint32_t* bucketStart,
+    uint32_t* bucketCounts)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalParticles) return;
+
+    uint32_t curCell = sortedCells[idx];
+    if (curCell >= numBuckets) return;
+
+    if (idx == totalParticles - 1) {
+        uint32_t start = bucketStart[curCell];
+        bucketCounts[curCell] = totalParticles - start;
+        return;
+    }
+
+    uint32_t nextCell = sortedCells[idx + 1];
+    if (curCell != nextCell) {
+        uint32_t start = bucketStart[curCell];
+        bucketCounts[curCell] = idx + 1 - start;
+    }
+}
+
 HairSimulationGPU::HairSimulationGPU()
     : m_numParticles(0)
     , m_initialized(false)
@@ -644,6 +739,9 @@ HairSimulationGPU::HairSimulationGPU()
     , m_d_spatialHashCounts(nullptr)
     , m_d_spatialHashSorted(nullptr)
     , m_d_spatialHashParticleCells(nullptr)
+    , m_d_particleStrandIds(nullptr)
+    , m_d_cellMarkers(nullptr)
+    , m_d_cellScatterIndices(nullptr)
     , m_numGuideCurves(0)
     , m_numVortexFields(0)
     , m_numColliders(0)
@@ -703,6 +801,12 @@ bool HairSimulationGPU::initialize(const SimulationParams& params) {
         m_numParticles
     );
 
+    initStrandIdsKernel<<<gridSize, blockSize>>>(
+        m_d_particleStrandIds,
+        m_params.numHairStrands,
+        m_params.segmentsPerStrand
+    );
+
     cudaDeviceSynchronize();
 
     m_initialized = true;
@@ -731,11 +835,14 @@ void HairSimulationGPU::allocateMemory() {
     cudaMalloc(&m_d_interpData, MAX_HAIR_STRANDS * sizeof(GPUInterpolationData));
     cudaMalloc(&m_d_guidePositions, MAX_GUIDE_CURVES * DEFAULT_SEGMENTS_PER_STRAND * sizeof(Vec3));
 
-    uint32_t numBuckets = SPATIAL_HASH_GRID_SIZE * SPATIAL_HASH_GRID_SIZE * SPATIAL_HASH_GRID_SIZE;
-    cudaMalloc(&m_d_spatialHashBuckets, numBuckets * sizeof(uint32_t));
-    cudaMalloc(&m_d_spatialHashCounts, numBuckets * sizeof(uint32_t));
+    cudaMalloc(&m_d_particleStrandIds, m_numParticles * sizeof(uint32_t));
+
+    cudaMalloc(&m_d_spatialHashBuckets, SPATIAL_HASH_NUM_BUCKETS * sizeof(uint32_t));
+    cudaMalloc(&m_d_spatialHashCounts, SPATIAL_HASH_NUM_BUCKETS * sizeof(uint32_t));
     cudaMalloc(&m_d_spatialHashSorted, m_numParticles * sizeof(uint32_t));
     cudaMalloc(&m_d_spatialHashParticleCells, m_numParticles * sizeof(uint32_t));
+    cudaMalloc(&m_d_cellMarkers, m_numParticles * sizeof(uint32_t));
+    cudaMalloc(&m_d_cellScatterIndices, m_numParticles * sizeof(uint32_t));
 }
 
 void HairSimulationGPU::freeMemory() {
@@ -752,10 +859,13 @@ void HairSimulationGPU::freeMemory() {
     if (m_d_colliders) cudaFree(m_d_colliders);
     if (m_d_interpData) cudaFree(m_d_interpData);
     if (m_d_guidePositions) cudaFree(m_d_guidePositions);
+    if (m_d_particleStrandIds) cudaFree(m_d_particleStrandIds);
     if (m_d_spatialHashBuckets) cudaFree(m_d_spatialHashBuckets);
     if (m_d_spatialHashCounts) cudaFree(m_d_spatialHashCounts);
     if (m_d_spatialHashSorted) cudaFree(m_d_spatialHashSorted);
     if (m_d_spatialHashParticleCells) cudaFree(m_d_spatialHashParticleCells);
+    if (m_d_cellMarkers) cudaFree(m_d_cellMarkers);
+    if (m_d_cellScatterIndices) cudaFree(m_d_cellScatterIndices);
 
     m_d_particles = nullptr;
     m_d_oldParticles = nullptr;
@@ -770,10 +880,13 @@ void HairSimulationGPU::freeMemory() {
     m_d_colliders = nullptr;
     m_d_interpData = nullptr;
     m_d_guidePositions = nullptr;
+    m_d_particleStrandIds = nullptr;
     m_d_spatialHashBuckets = nullptr;
     m_d_spatialHashCounts = nullptr;
     m_d_spatialHashSorted = nullptr;
     m_d_spatialHashParticleCells = nullptr;
+    m_d_cellMarkers = nullptr;
+    m_d_cellScatterIndices = nullptr;
 }
 
 void HairSimulationGPU::update(float deltaTime) {
@@ -892,15 +1005,13 @@ void HairSimulationGPU::computePhysics(float dt) {
     if (m_params.enableSelfCollision) {
         buildSpatialHash();
 
-        uint32_t numBuckets = SPATIAL_HASH_GRID_SIZE * SPATIAL_HASH_GRID_SIZE * SPATIAL_HASH_GRID_SIZE;
-
         selfCollisionKernel<<<gridSize, blockSize>>>(
             m_d_particles,
             m_d_spatialHashSorted,
             m_d_spatialHashBuckets,
             m_d_spatialHashCounts,
+            m_d_particleStrandIds,
             m_numParticles,
-            numBuckets,
             m_params.selfCollisionRadius,
             0.8f,
             m_params.segmentsPerStrand
@@ -913,42 +1024,43 @@ void HairSimulationGPU::computePhysics(float dt) {
 void HairSimulationGPU::buildSpatialHash() {
     uint32_t blockSize = 256;
     uint32_t gridSize = (m_numParticles + blockSize - 1) / blockSize;
-    uint32_t numBuckets = SPATIAL_HASH_GRID_SIZE * SPATIAL_HASH_GRID_SIZE * SPATIAL_HASH_GRID_SIZE;
+    uint32_t numBuckets = SPATIAL_HASH_NUM_BUCKETS;
 
+    cudaMemset(m_d_spatialHashBuckets, 0xFFFFFFFF, numBuckets * sizeof(uint32_t));
     cudaMemset(m_d_spatialHashCounts, 0, numBuckets * sizeof(uint32_t));
 
-    float cellSize = m_params.selfCollisionRadius * 4.0f;
+    float cellSize = m_params.selfCollisionRadius * 3.0f;
 
-    spatialHashBuildKernel<<<gridSize, blockSize>>>(
+    spatialHashAssignKernel<<<gridSize, blockSize>>>(
         m_d_particles,
         m_numParticles,
         cellSize,
         SPATIAL_HASH_GRID_SIZE,
-        m_d_spatialHashParticleCells,
-        m_d_spatialHashCounts,
-        numBuckets
+        numBuckets,
+        m_d_spatialHashParticleCells
     );
-
-    cudaDeviceSynchronize();
 
     thrust::device_ptr<uint32_t> d_cells(m_d_spatialHashParticleCells);
     thrust::device_ptr<uint32_t> d_indices(m_d_spatialHashSorted);
     thrust::sequence(d_indices, d_indices + m_numParticles);
     thrust::sort_by_key(d_cells, d_cells + m_numParticles, d_indices);
 
-    thrust::device_ptr<uint32_t> d_buckets(m_d_spatialHashBuckets);
-    thrust::device_ptr<uint32_t> d_counts(m_d_spatialHashCounts);
+    uint32_t boundaryGrid = (m_numParticles + blockSize) / blockSize;
+    bucketBoundaryMarkersKernel<<<boundaryGrid, blockSize>>>(
+        m_d_spatialHashParticleCells,
+        m_numParticles,
+        numBuckets,
+        m_d_spatialHashBuckets,
+        m_d_spatialHashCounts
+    );
 
-    uint32_t prevCell = d_cells[0];
-    d_buckets[prevCell] = 0;
-
-    for (uint32_t i = 1; i < m_numParticles; i++) {
-        uint32_t curCell = d_cells[i];
-        if (curCell != prevCell) {
-            d_buckets[curCell] = i;
-            prevCell = curCell;
-        }
-    }
+    countBucketSizesKernel<<<gridSize, blockSize>>>(
+        m_d_spatialHashParticleCells,
+        m_numParticles,
+        numBuckets,
+        m_d_spatialHashBuckets,
+        m_d_spatialHashCounts
+    );
 }
 
 void HairSimulationGPU::setGuideCurve(uint32_t index, const std::vector<Vec3>& points) {

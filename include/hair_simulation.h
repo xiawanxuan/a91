@@ -76,6 +76,9 @@ private:
     uint32_t* m_d_spatialHashCounts;
     uint32_t* m_d_spatialHashSorted;
     uint32_t* m_d_spatialHashParticleCells;
+    uint32_t* m_d_particleStrandIds;
+    uint32_t* m_d_cellMarkers;
+    uint32_t* m_d_cellScatterIndices;
 
     uint32_t m_numGuideCurves;
     uint32_t m_numVortexFields;

@@ -11,8 +11,9 @@ constexpr uint32_t MAX_HAIR_STRANDS = 500000;
 constexpr uint32_t DEFAULT_SEGMENTS_PER_STRAND = 20;
 constexpr uint32_t MAX_VORTEX_FIELDS = 5;
 constexpr uint32_t MAX_COLLISION_CAPSULES = 32;
-constexpr uint32_t SPATIAL_HASH_GRID_SIZE = 256;
-constexpr uint32_t SPATIAL_HASH_BUCKET_SIZE = 8;
+constexpr uint32_t SPATIAL_HASH_GRID_SIZE = 512;
+constexpr uint32_t SPATIAL_HASH_BUCKET_SIZE = 16;
+constexpr uint32_t SPATIAL_HASH_NUM_BUCKETS = 2097169;  // Prime ~2M for hash table
 
 struct Vec3 {
     float x, y, z;
